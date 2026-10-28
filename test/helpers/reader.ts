@@ -8,11 +8,12 @@ import { VisionModel } from '../../src/reading/services/vision.ts';
 import type { MockServices } from './mock-services.ts';
 
 /** A document reader against the mock services and the real pdf.js process. */
-export const createReader = (mock: MockServices, env: Record<string, string> = {}) => {
+/** Without a mock, `env` names the services. */
+export const createReader = (mock: MockServices | undefined, env: Record<string, string> = {}) => {
     const config = loadConfig({
-        LOUPE_DOCUMENT_INTELLIGENCE_ENDPOINT: mock.url,
+        LOUPE_DOCUMENT_INTELLIGENCE_ENDPOINT: mock?.url ?? '',
         LOUPE_DOCUMENT_INTELLIGENCE_KEY: 'k',
-        LOUPE_OPENAI_ENDPOINT: mock.url,
+        LOUPE_OPENAI_ENDPOINT: mock?.url ?? '',
         LOUPE_OPENAI_KEY: 'k',
         ...env,
     });

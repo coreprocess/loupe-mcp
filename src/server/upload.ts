@@ -20,24 +20,24 @@ export const uploadHandler =
     (deps: UploadDeps) =>
     async (req: Request, res: Response): Promise<void> => {
         res.setHeader('Cache-Control', 'no-store');
+        // a refused body is not read to its end; the connection closes after the answer
+        const refuse = (status: number, code: string, message: string) => {
+            if (!req.complete) res.setHeader('Connection', 'close');
+            sendError(res, status, code, message);
+        };
         // the path as sent, still percent-encoded: `/u/<token>/<name>`
         const [, , token = '', segment, ...rest] = req.path.split('/');
         const payload = deps.signer.verify('upload', token);
         if (!payload) {
-            sendError(res, 403, 'forbidden', 'Invalid upload token');
+            refuse(403, 'forbidden', 'Invalid upload token');
             return;
         }
         if (payload.expires * 1000 < Date.now()) {
-            sendError(
-                res,
-                403,
-                'expired',
-                'The upload URL expired; call create_upload with the uploadId for a fresh one'
-            );
+            refuse(403, 'expired', 'The upload URL expired; call create_upload with the uploadId for a fresh one');
             return;
         }
         if (!segment || rest.length > 0) {
-            sendError(res, 400, 'invalid_argument', 'Append one file name to the upload URL: PUT <uploadUrl><name>');
+            refuse(400, 'invalid_argument', 'Append one file name to the upload URL: PUT <uploadUrl><name>');
             return;
         }
         const declared = req.headers['content-length'];
@@ -63,8 +63,6 @@ export const uploadHandler =
             );
             res.status(201).json({ name: file.name, bytes: file.bytes, sha256: file.sha256, type: file.type });
         } catch (error) {
-            // the rest of a refused body is not read; the connection closes after the answer
-            if (!req.complete) res.setHeader('Connection', 'close');
             if (res.headersSent) {
                 res.destroy();
                 return;
@@ -74,10 +72,10 @@ export const uploadHandler =
                     { uploadId: payload.id, issuedTo: payload.user, refused: error.code, client: req.ip },
                     'upload'
                 );
-                sendError(res, httpStatusOf(error), error.code, error.message);
+                refuse(httpStatusOf(error), error.code, error.message);
                 return;
             }
             deps.loggers.log.error({ err: error, uploadId: payload.id }, 'upload failed');
-            sendError(res, 500, 'internal', 'The upload failed');
+            refuse(500, 'internal', 'The upload failed');
         }
     };

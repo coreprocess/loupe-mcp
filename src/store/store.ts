@@ -10,6 +10,11 @@ export interface StoredObjectInfo {
     lastModified: Date;
 }
 
+export interface ListedObject {
+    path: string;
+    size: number;
+}
+
 export interface Store {
     readonly kind: 'filesystem' | 'azureblob';
     init(): Promise<void>;
@@ -23,8 +28,8 @@ export interface Store {
     getRange(path: string, offset: number, length: number): Promise<Buffer>;
     head(path: string): Promise<StoredObjectInfo | undefined>;
     stream(path: string, range?: { offset: number; length: number }): Promise<Readable>;
-    /** The paths under a prefix ending in `/`, at any depth, in lexicographic order. */
-    list(prefix: string): AsyncIterable<string>;
+    /** The objects under a prefix ending in `/`, at any depth, in lexicographic order. */
+    list(prefix: string): AsyncIterable<ListedObject>;
     /** Deletes the object; a missing one is no error. */
     delete(path: string): Promise<void>;
     deletePrefix(prefix: string): Promise<void>;

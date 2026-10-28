@@ -194,6 +194,30 @@ describe('http app (data plane and tools, without authorization on localhost)', 
         assert.equal(cancelled.status, 'completed');
     });
 
+    it('refuses an oversized upload at once and closes the connection', async () => {
+        const upload = await call('create_upload', {});
+        const url = new URL(`${upload.uploadUrl}huge.pdf`);
+        const answer = await new Promise<{ status: number; connection: string | undefined }>((resolve, reject) => {
+            const req = request(
+                {
+                    host: url.hostname,
+                    port: url.port,
+                    path: url.pathname,
+                    method: 'PUT',
+                    headers: { 'content-length': String(64 * 1024 * 1024) },
+                },
+                (res) => {
+                    res.resume();
+                    resolve({ status: res.statusCode ?? 0, connection: res.headers.connection });
+                }
+            );
+            req.on('error', reject);
+            // only the first bytes of the declared body are ever sent
+            req.write(Buffer.alloc(1024));
+        });
+        assert.deepEqual(answer, { status: 413, connection: 'close' });
+    });
+
     it('reports tool errors with stable codes', async () => {
         const missing = await client.callTool({ name: 'get_job', arguments: { jobId: 'j_unknown' } });
         assert.equal(missing.isError, true);

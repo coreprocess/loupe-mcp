@@ -5,7 +5,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { LoupeError } from '../core/errors.ts';
-import type { Store, StoredObjectInfo } from './store.ts';
+import type { ListedObject, Store, StoredObjectInfo } from './store.ts';
 
 /**
  * The store on the local filesystem (stdio mode, tests). One process owns it, so leases are held in
@@ -105,18 +105,22 @@ export class FilesystemStore implements Store {
         return createReadStream(full, { start: range.offset, end: range.offset + range.length - 1 });
     }
 
-    async *list(prefix: string): AsyncIterable<string> {
-        const paths: string[] = [];
+    async *list(prefix: string): AsyncIterable<ListedObject> {
+        const objects: ListedObject[] = [];
         const walk = async (directory: string): Promise<void> => {
             const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
             for (const entry of entries) {
                 const full = join(directory, entry.name);
                 if (entry.isDirectory()) await walk(full);
-                else if (!entry.name.endsWith('.tmp')) paths.push(relative(this.#root, full).split(sep).join('/'));
+                else if (!entry.name.endsWith('.tmp')) {
+                    const size = (await stat(full).catch(() => undefined))?.size;
+                    if (size !== undefined)
+                        objects.push({ path: relative(this.#root, full).split(sep).join('/'), size });
+                }
             }
         };
         await walk(this.#path(prefix));
-        yield* paths.sort();
+        yield* objects.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     }
 
     async delete(path: string): Promise<void> {

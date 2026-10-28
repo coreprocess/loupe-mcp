@@ -231,7 +231,7 @@ export class JobService {
     /** Deletes uploads and jobs whose retention has passed (concept §6.4). */
     async sweep(): Promise<void> {
         const now = Date.now();
-        for await (const path of this.#store.list(paths.uploads)) {
+        for await (const { path } of this.#store.list(paths.uploads)) {
             if (!path.endsWith('/upload.json')) continue;
             const record = await getJson<UploadRecord>(this.#store, path);
             if (record && now > Date.parse(record.expiresAt)) {
@@ -239,7 +239,7 @@ export class JobService {
                 this.#loggers.log.info({ uploadId: record.uploadId }, 'expired upload deleted');
             }
         }
-        for await (const path of this.#store.list(paths.jobs)) {
+        for await (const { path } of this.#store.list(paths.jobs)) {
             if (!path.endsWith('/job.json')) continue;
             const job = await getJson<JobRecord>(this.#store, path);
             if (job && now > Date.parse(job.expiresAt)) {
@@ -248,7 +248,7 @@ export class JobService {
                 this.#loggers.log.info({ jobId: job.jobId }, 'expired job deleted');
             }
         }
-        for await (const path of this.#store.list(paths.queue)) {
+        for await (const { path } of this.#store.list(paths.queue)) {
             if (!(await this.#store.head(paths.job(jobIdOfQueueEntry(path)))))
                 await this.#store.delete(path).catch(() => undefined);
         }

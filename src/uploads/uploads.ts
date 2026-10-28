@@ -51,7 +51,7 @@ export class UploadService {
     /** The accepted files, in the order they arrived. */
     async files(uploadId: string): Promise<UploadedFile[]> {
         const files: UploadedFile[] = [];
-        for await (const path of this.#store.list(paths.acceptedPrefix(uploadId))) {
+        for await (const { path } of this.#store.list(paths.acceptedPrefix(uploadId))) {
             const file = await getJson<UploadedFile>(this.#store, path);
             if (file) files.push(file);
         }
@@ -75,14 +75,19 @@ export class UploadService {
         if (await this.#store.head(filePath))
             throw new LoupeError('conflict', `The upload has a file '${name}' already`);
 
-        const accepted = await this.files(uploadId);
-        if (accepted.length >= this.#limits.uploadMaxFiles) {
+        // the stored files, as one listing: a file being uploaded right now counts as well
+        let count = 0;
+        let used = 0;
+        for await (const { size } of this.#store.list(paths.uploadFilesPrefix(uploadId))) {
+            count++;
+            used += size;
+        }
+        if (count >= this.#limits.uploadMaxFiles) {
             throw new LoupeError(
                 'limit_exceeded',
                 `The upload holds the maximum of ${this.#limits.uploadMaxFiles} files`
             );
         }
-        const used = accepted.reduce((sum, file) => sum + file.bytes, 0);
         const allowed = Math.min(this.#limits.maxFileBytes, this.#limits.uploadMaxBytes - used);
         if (allowed <= 0) {
             throw new LoupeError(

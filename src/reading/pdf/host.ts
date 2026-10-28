@@ -196,15 +196,9 @@ export class PdfReaderHost {
         }
     }
 
-    /** This process's Node flags (the source loader in development), minus test, debug and heap flags, plus the cap. */
+    /** Only the heap cap: none of this process's flags (test runner, debugger, eval) belong to the reader. */
     #execArgv(): string[] {
-        return [
-            ...process.execArgv.filter(
-                (arg) =>
-                    !arg.startsWith('--max-old-space-size') && !arg.startsWith('--test') && !arg.startsWith('--inspect')
-            ),
-            `--max-old-space-size=${this.#options.maxHeapMb}`,
-        ];
+        return [`--max-old-space-size=${this.#options.maxHeapMb}`];
     }
 }
 

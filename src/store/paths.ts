@@ -11,6 +11,7 @@ export const paths = {
     upload: (uploadId: string) => `uploads/${uploadId}/upload.json`,
     uploadPrefix: (uploadId: string) => `uploads/${uploadId}/`,
     uploadFile: (uploadId: string, key: string) => `uploads/${uploadId}/files/${key}`,
+    uploadFilesPrefix: (uploadId: string) => `uploads/${uploadId}/files/`,
     accepted: (uploadId: string, key: string) => `uploads/${uploadId}/accepted/${key}.json`,
     acceptedPrefix: (uploadId: string) => `uploads/${uploadId}/accepted/`,
     jobs: 'jobs/',

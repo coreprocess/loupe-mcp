@@ -89,7 +89,7 @@ export class JobRunner {
 
     async #poll(): Promise<void> {
         if (this.#active.size < this.#limits.maxActiveJobs) {
-            for await (const entry of this.#store.list(paths.queue)) {
+            for await (const { path: entry } of this.#store.list(paths.queue)) {
                 if (this.#stopping || this.#active.size >= this.#limits.maxActiveJobs) break;
                 const jobId = jobIdOfQueueEntry(entry);
                 if (this.#active.has(jobId)) continue;

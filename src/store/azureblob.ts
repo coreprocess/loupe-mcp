@@ -2,7 +2,7 @@ import type { Readable } from 'node:stream';
 import { DefaultAzureCredential } from '@azure/identity';
 import { BlobServiceClient, type ContainerClient, RestError } from '@azure/storage-blob';
 import { LoupeError } from '../core/errors.ts';
-import type { Store, StoredObjectInfo } from './store.ts';
+import type { ListedObject, Store, StoredObjectInfo } from './store.ts';
 
 const UPLOAD_BLOCK_BYTES = 4 * 1024 * 1024;
 const UPLOAD_CONCURRENCY = 2;
@@ -96,8 +96,10 @@ export class AzureBlobStore implements Store {
         }
     }
 
-    async *list(prefix: string): AsyncIterable<string> {
-        for await (const blob of this.#container.listBlobsFlat({ prefix })) yield blob.name;
+    async *list(prefix: string): AsyncIterable<ListedObject> {
+        for await (const blob of this.#container.listBlobsFlat({ prefix })) {
+            yield { path: blob.name, size: blob.properties.contentLength ?? 0 };
+        }
     }
 
     async delete(path: string): Promise<void> {
@@ -107,7 +109,7 @@ export class AzureBlobStore implements Store {
     }
 
     async deletePrefix(prefix: string): Promise<void> {
-        for await (const path of this.list(prefix)) await this.delete(path);
+        for await (const { path } of this.list(prefix)) await this.delete(path);
     }
 
     async acquireLease(path: string, seconds: number): Promise<string | undefined> {
