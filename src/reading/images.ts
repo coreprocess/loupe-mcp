@@ -1,6 +1,6 @@
 /**
  * Raster images as page images for the vision model (concept §6.2): upright by their EXIF
- * orientation, at most 4096 pixels on the long edge, as JPEG. HEIC/HEIF and BMP are decoded first,
+ * orientation, at most 12 megapixels (the model reads them at the size sent), as JPEG. HEIC/HEIF and BMP are decoded first,
  * since sharp's own build reads neither; TIFF is read page by page. Every decoder checks the stated
  * size before it decodes a pixel, so a small file cannot claim a gigantic picture.
  */
@@ -12,7 +12,8 @@ import { DocumentError } from './errors.ts';
 import type { VisionImage } from './services/vision.ts';
 
 const MAX_PIXELS = 100_000_000;
-const MAX_LONG_EDGE = 4096;
+/** The largest page image sent, in pixels; the model reads images at their original size. */
+const MAX_PAGE_PIXELS = 12_000_000;
 const JPEG_QUALITY = 90;
 
 const unreadable = (detail: string, cause?: unknown): DocumentError =>
@@ -76,8 +77,14 @@ const open = async (type: DocumentType, content: Buffer, page: number): Promise<
 export const pageImage = async (type: DocumentType, content: Buffer, page: number): Promise<VisionImage> => {
     try {
         const image = await open(type, content, page);
+        // the upright size: orientations 5 to 8 turn the picture by a quarter
+        const meta = await image.metadata();
+        const turned = (meta.orientation ?? 1) >= 5;
+        const width = (turned ? meta.height : meta.width) ?? 1;
+        const height = (turned ? meta.width : meta.height) ?? 1;
+        const scale = Math.min(1, Math.sqrt(MAX_PAGE_PIXELS / (width * height)));
         const data = await image
-            .resize({ width: MAX_LONG_EDGE, height: MAX_LONG_EDGE, fit: 'inside', withoutEnlargement: true })
+            .resize(Math.floor(width * scale), Math.floor(height * scale), { fit: 'inside', withoutEnlargement: true })
             .flatten({ background: '#ffffff' })
             .jpeg({ quality: JPEG_QUALITY })
             .toBuffer();

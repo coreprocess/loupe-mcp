@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 
 /**
  * Mocks of Azure Document Intelligence (layout analysis as a long-running operation) and Azure
- * OpenAI (chat completions) on one local HTTP server. The transcript has one page per selected page
+ * OpenAI (Responses API) on one local HTTP server. The transcript has one page per selected page
  * (`pages` query, or one page); the vision model answers with the page number it was asked about.
  */
 
@@ -17,7 +17,7 @@ export interface VisionCall {
     page: number;
     images: number;
     text: string;
-    system: string;
+    instructions: string;
     body: Record<string, unknown>;
 }
 
@@ -34,6 +34,10 @@ export interface MockBehavior {
     rejectPages: Set<number>;
     /** Pages whose answer is cut off. */
     truncatePages: Set<number>;
+    /** Pages the model refuses in its answer. */
+    refusePages: Set<number>;
+    /** Pages whose first response the service fails itself. */
+    failOncePages: Set<number>;
     /** Delays every vision answer. */
     visionDelayMs: number;
     /** Status answered to every request, e.g. 401 for a wrong key. */
@@ -75,6 +79,8 @@ export class MockServices {
             runningPolls: 0,
             rejectPages: new Set(),
             truncatePages: new Set(),
+            refusePages: new Set(),
+            failOncePages: new Set(),
             visionDelayMs: 0,
             forceStatus: undefined,
         };
@@ -157,19 +163,19 @@ export class MockServices {
             });
             return;
         }
-        if (req.method === 'POST' && url.pathname.includes('/chat/completions')) {
+        if (req.method === 'POST' && url.pathname === '/openai/v1/responses') {
             const request = JSON.parse(body.toString('utf8')) as {
-                messages: { role: string; content: string | { type: string; text?: string }[] }[];
+                instructions?: string;
+                input: { role: string; content: { type: string; text?: string; detail?: string }[] }[];
             };
-            const user = request.messages.find((message) => message.role === 'user');
-            const parts = Array.isArray(user?.content) ? user.content : [];
-            const text = parts.find((part) => part.type === 'text')?.text ?? '';
+            const parts = request.input.find((item) => item.role === 'user')?.content ?? [];
+            const text = parts.find((part) => part.type === 'input_text')?.text ?? '';
             const page = Number(/## Page number\n\n(\d+)/.exec(text)?.[1] ?? 0);
             this.visionCalls.push({
                 page,
-                images: parts.filter((part) => part.type === 'image_url').length,
+                images: parts.filter((part) => part.type === 'input_image').length,
                 text,
-                system: String(request.messages.find((message) => message.role === 'system')?.content ?? ''),
+                instructions: request.instructions ?? '',
                 body: request as unknown as Record<string, unknown>,
             });
             if (this.behavior.visionDelayMs)
@@ -178,9 +184,31 @@ export class MockServices {
                 send(res, 400, { error: { code: 'content_filter', message: 'filtered' } });
                 return;
             }
-            const finish = this.behavior.truncatePages.has(page) ? 'length' : 'stop';
+            if (this.behavior.failOncePages.delete(page)) {
+                send(res, 200, { status: 'failed', error: { code: 'server_error', message: 'failed' }, output: [] });
+                return;
+            }
+            if (this.behavior.truncatePages.has(page)) {
+                send(res, 200, {
+                    status: 'incomplete',
+                    incomplete_details: { reason: 'max_output_tokens' },
+                    output: [],
+                });
+                return;
+            }
+            if (this.behavior.refusePages.has(page)) {
+                send(res, 200, {
+                    status: 'completed',
+                    output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'I cannot help with that.' }] }],
+                });
+                return;
+            }
             send(res, 200, {
-                choices: [{ finish_reason: finish, message: { content: `<p>Vision page ${page}</p>` } }],
+                status: 'completed',
+                output: [
+                    { type: 'reasoning', summary: [] },
+                    { type: 'message', content: [{ type: 'output_text', text: `<p>Vision page ${page}</p>` }] },
+                ],
             });
             return;
         }

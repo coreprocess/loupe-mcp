@@ -25,3 +25,18 @@ export const makeOffice = (kind: keyof typeof CONTENT_TYPES, extra: Record<strin
         })
     );
 };
+
+/** A valid minimal Word document (WordprocessingML with its relationships), one paragraph per line. */
+export const makeWord = (kind: 'docx' | 'docm', lines: string[]): Buffer => {
+    const types = `<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="${CONTENT_TYPES[kind]}"/></Types>`;
+    const rels = `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`;
+    const paragraphs = lines.map((line) => `<w:p><w:r><w:t xml:space="preserve">${line}</w:t></w:r></w:p>`).join('');
+    const document = `<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${paragraphs}</w:body></w:document>`;
+    return Buffer.from(
+        zipSync({
+            '[Content_Types].xml': strToU8(types),
+            '_rels/.rels': strToU8(rels),
+            'word/document.xml': strToU8(document),
+        })
+    );
+};

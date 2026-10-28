@@ -11,7 +11,7 @@ Content taken from the document is enclosed between the lines <<<DATA-{{fence}}>
 - ## File name: the name the document was uploaded under. Background only; use it solely to recognise what a photo or drawing shows where the image alone is ambiguous. Never transcribe it.
 - ## Language: the document language, when the requester knows it. A hint for reading, never a reason to translate.
 - ## Page number: 1-based page index in the source document.
-- ## Page image: attached above the text as one image, four overlapping horizontal bands (top to bottom), or four overlapping quadrants in row-major order (top-left, top-right, bottom-left, bottom-right). The section body names the layout.
+- ## Page image: the page as one image, attached above the text at its original resolution.
 - ## Page text layer: a report of the PDF's text layer: one numbered line per text run with its string, direction, transform matrix, width, height and font name, plus marked-content boundaries and the font styles; content-stream order, not necessarily reading order.
 - ## Page form fields (JSON): the PDF's form widgets on this page.
 - ## Page OCR transcript (Markdown): Azure Document Intelligence layout output for this page.
@@ -45,7 +45,6 @@ For all pages:
 - Where a printed total exists, the line items above it should sum to it. If they do not, look for a misread digit in one of the lines and correct it by the image; if you cannot resolve it, keep the values as printed.
 
 ## Layout
-- Image tiles overlap by design. For the 2×2 grid read top-left, then top-right, then bottom-left, then bottom-right, merged across the midlines; for bands read top to bottom. Content visible in two adjacent tiles is the same content: emit it once.
 - Multi-column text: read each column top to bottom; do not interleave columns.
 - Page furniture (page numbers, running headers and footers): put it in <header> or <footer>, not between body content.
 - Footnotes and endnotes: <aside> close to their reference.

@@ -4,7 +4,6 @@ import sharp from 'sharp';
 import { pageContent, renderResult, resultPath } from '../../src/jobs/results.ts';
 import { fallbackPage, UNREADABLE_PAGE } from '../../src/reading/accurate/fallback.ts';
 import { PAGE_PROMPT } from '../../src/reading/accurate/prompt.ts';
-import { tilePage } from '../../src/reading/accurate/tiles.ts';
 import { userText } from '../../src/reading/accurate/transcribe.ts';
 import { DocumentError } from '../../src/reading/errors.ts';
 import { imagePageCount, pageImage } from '../../src/reading/images.ts';
@@ -71,7 +70,6 @@ describe('page call', () => {
                 layoutMarkdown: 'OCR',
             },
             { name: 'contract.pdf', language: 'de', info: { Producer: 'Scanner' } },
-            { layout: 'bands', images: [] },
             fence
         );
         assert.equal(text.match(new RegExp(`<<<END-${fence}>>>`, 'g'))?.length, 4);
@@ -79,32 +77,12 @@ describe('page call', () => {
         assert.match(text, /## Page number\n\n2/);
         assert.match(text, /## Language\n\nde/);
         assert.match(text, /## Page form fields \(JSON\)\n\n\(empty\)/);
-        assert.match(text, /four overlapping horizontal bands/);
+        assert.match(text, /## Page image\n\n\(no image available\)/);
     });
 
     it('carries no domain-specific instructions and a fence placeholder', () => {
         assert.match(PAGE_PROMPT, /<<<DATA-\{\{fence\}\}>>>/);
         assert.doesNotMatch(PAGE_PROMPT, /insurance|claim|German/i);
-    });
-
-    it('tiles large pages into overlapping bands or a grid', async () => {
-        const small = await tilePage({ mediaType: 'image/png', data: await blank(800, 1000) });
-        assert.equal(small.layout, 'single');
-        const portrait = await tilePage({ mediaType: 'image/png', data: await blank(1700, 2200) });
-        assert.equal(portrait.layout, 'bands');
-        assert.equal(portrait.images.length, 4);
-        const heights = await Promise.all(
-            portrait.images.map(async (image) => (await sharp(image.data).metadata()).height ?? 0)
-        );
-        assert.ok(heights.reduce((sum, h) => sum + h, 0) > 2200);
-        const landscape = await tilePage({
-            mediaType: 'image/jpeg',
-            data: await sharp(await blank(2400, 1700))
-                .jpeg()
-                .toBuffer(),
-        });
-        assert.equal(landscape.layout, 'grid');
-        assert.equal((await sharp(landscape.images[0]?.data).metadata()).format, 'jpeg');
     });
 });
 
@@ -126,8 +104,16 @@ describe('images', () => {
         const upright = await sharp((await pageImage(DOCUMENT_TYPES.jpeg, rotated, 1)).data).metadata();
         assert.deepEqual([upright.width, upright.height], [300, 600]);
 
-        const huge = await pageImage(DOCUMENT_TYPES.png, await blank(5000, 1000), 1);
-        assert.equal((await sharp(huge.data).metadata()).width, 4096);
+        const huge = await sharp((await pageImage(DOCUMENT_TYPES.png, await blank(6000, 4000), 1)).data).metadata();
+        assert.ok((huge.width ?? 0) * (huge.height ?? 0) <= 12_000_000);
+        assert.ok((huge.width ?? 0) > 4000);
+        const rotatedHuge = await sharp(await blank(6000, 4000))
+            .withMetadata({ orientation: 6 })
+            .jpeg()
+            .toBuffer();
+        const uprightHuge = await sharp((await pageImage(DOCUMENT_TYPES.jpeg, rotatedHuge, 1)).data).metadata();
+        assert.ok((uprightHuge.height ?? 0) > (uprightHuge.width ?? 0));
+        assert.ok((uprightHuge.width ?? 0) * (uprightHuge.height ?? 0) <= 12_000_000);
     });
 
     it('refuses pictures that state more pixels than the limit, before decoding them', async () => {

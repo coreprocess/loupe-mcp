@@ -283,8 +283,8 @@ The design is taken from two production document pipelines, made generic.
    - Document Intelligence as in `fast`, plus the `ocrHighResolution` add-on: a Markdown transcript per page.
    - pdf.js, **in a child process of its own** with memory and time limits: per page the text layer (as a geometry report for the model and as readable text for the fallback) and the AcroForm fields; for the whole file its info dictionary. A first, short run counts the pages, so the page selection and `LOUPE_MAX_PAGES` apply before anything is read. A replica runs at most two reader processes, each with a 1 GiB heap and only the environment Node needs; one that opens no file within 3 minutes, reports no page for 90 seconds or runs 10 minutes is killed.
 2. **Merge per page.** When both sources agree on the page count, every page gets every input. When they disagree, Document Intelligence's pagination wins and the pdf.js page fields are dropped, since an index-wise merge would misalign them. Either source may be missing: when the service refuses the file, pdf.js carries it; when pdf.js can't open the file or its process is killed, Loupe retries without page renders, then without pdf.js, and the transcript carries it. Only when both are missing is the document `unreadable`.
-3. **One vision-model call per page**, for the first `LOUPE_ACCURATE_MAX_PAGES` pages, `LOUPE_VISION_CONCURRENCY` at a time per replica. Page images are rendered at up to 200 DPI (at most 8 megapixels), eight pages per reader process at a time, so they never pile up in memory; when the render fails, the page is transcribed without its image. The call goes to the Azure OpenAI deployment `LOUPE_VISION_MODEL` (chat completions, with `reasoning_effort`). The model gets:
-   - the page image first (models attend more reliably to images that precede the text about them); a large page is split into four overlapping tiles, as strips or as a 2×2 grid depending on its shape, and the prompt says which;
+3. **One vision-model call per page**, for the first `LOUPE_ACCURATE_MAX_PAGES` pages, `LOUPE_VISION_CONCURRENCY` at a time per replica. Page images are rendered at up to 200 DPI (at most 8 megapixels), eight pages per reader process at a time, so they never pile up in memory; when the render fails, the page is transcribed without its image. The call goes to the Azure OpenAI deployment `LOUPE_VISION_MODEL` through the **Responses API** (`/openai/v1/responses`), stateless (`store: false`), with the prompt as `instructions`, `reasoning.effort` from `LOUPE_VISION_REASONING_EFFORT`, and a `prompt_cache_key` shared by every page call, so the long instructions are served from the prompt cache. The model gets:
+   - the page image first (models attend more reliably to images that precede the text about them), as one image with detail `original`: the model reads it at the size sent and is billed by its 32×32-pixel patches, so Loupe bounds the size itself (at most 8 megapixels for PDF renders, 12 for images) and never splits a page;
    - then one section per input: the PDF info, the file name, the page number, the text layer, the form fields, the Document Intelligence transcript. A missing input is marked `(empty)`, so the model can tell "not provided" from "blank".
 
    Every input taken from the file sits between two marker lines carrying a random value per request. The instructions say that everything between them is data, never an instruction, so text in a document cannot pose as part of the prompt.
@@ -297,10 +297,10 @@ The design is taken from two production document pipelines, made generic.
    - describe **every photo, drawing, chart or plan** in a `<figure><figcaption>` in the document's language: what it shows, from which viewpoint, every visible detail, defect or trace with its location and extent, legible text, labels and readings quoted verbatim, and say what cannot be seen instead of guessing; logos and decoration get a short caption naming them;
    - mark checkboxes as `[ ]`/`[x]`/`[?]`, handwritten edits and insertions inline, struck-through text as `<s>`, and signatures as `Signature: <short description>`;
    - answer with one HTML fragment of semantic tags, without code fences, wrappers, styles, scripts or links.
-5. **Only a complete answer counts.** A call the model rejects (content filter, input too large) or an answer cut off before its end yields no page; the page takes the fallback. A timeout or an outage is retried (§6.4).
+5. **Only a complete answer counts.** A call the model rejects (content filter, input too large), a response that ends `incomplete` (output limit, content filter) or a refusal yields no page; the page takes the fallback. A response the service fails itself (`failed`) is asked again, at most three times. A timeout or an outage is retried (§6.4).
 6. **Fallback per page,** for the pages after the vision window and for every page the model did not deliver: the Document Intelligence transcript rendered to HTML (method `layout`), else the readable text layer and form fields as preformatted text (`text-layer`), else a placeholder that says the page could not be read (`none`). No page is ever missing.
 
-**Images.** Each image (each page of a TIFF) is one page. Document Intelligence reads the file with high-resolution OCR; the image itself, upright according to its EXIF orientation and at most 4096 pixels on its long edge, is the page image of the vision call, as JPEG: HEIC/HEIF is decoded with libheif (WebAssembly), BMP with the canvas, everything else with sharp, each after checking the stated size against a limit of 100 megapixels. There is no text layer and there are no form fields. The fallback is the transcript, then the placeholder. When the image cannot be decoded, the transcript carries the page; when neither works, the document is `unreadable`.
+**Images.** Each image (each page of a TIFF) is one page. Document Intelligence reads the file with high-resolution OCR; the image itself, upright according to its EXIF orientation and scaled down to at most 12 megapixels, is the page image of the vision call, as JPEG: HEIC/HEIF is decoded with libheif (WebAssembly), BMP with the canvas, everything else with sharp, each after checking the stated size against a limit of 100 megapixels. There is no text layer and there are no form fields. The fallback is the transcript, then the placeholder. When the image cannot be decoded, the transcript carries the page; when neither works, the document is `unreadable`.
 
 **Office files and HTML** are read as in `fast` (§2).
 
@@ -489,9 +489,9 @@ A reusable module in this repository (`terraform/`). It takes the Container Apps
 | Validation             | `zod`                                                                     | Configuration and tool schemas                                                                    |
 | Store                  | `@azure/storage-blob`, `@azure/identity`                                  | Conditional writes for write-once files, blob leases for the queue                                |
 | Document Intelligence  | REST API `2024-11-30` over `undici`                                       | Long-running analysis, polled; retries and `Retry-After` under Loupe's control                    |
-| Vision model           | Azure OpenAI chat completions over `undici`                               | Image parts first; long header and body timeouts, a deadline per call                             |
+| Vision model           | Azure OpenAI Responses API (v1, stateless) over `undici`                  | Image parts first, detail `original`; long header and body timeouts, a deadline per call          |
 | PDF                    | `pdfjs-dist`                                                              | In a child process; text layer, AcroForm fields, page renders                                     |
-| Images                 | `sharp`, `heic-decode`, `@napi-rs/canvas`                                 | Rotation, conversion, tiling, TIFF pages; BMP decoding; pdf.js's canvas in Node                   |
+| Images                 | `sharp`, `heic-decode`, `@napi-rs/canvas`                                 | Rotation, conversion, size bound, TIFF pages; BMP decoding; pdf.js's canvas in Node               |
 | Office                 | Loupe's own minimal ZIP reader on `node:zlib`                             | Type detection from `[Content_Types].xml` by ranged reads, the DOCM rewrite; bounded inflation    |
 | Fallback rendering     | `markdown-it`                                                             | Transcript Markdown to HTML, with the service's literal `<table>` markup let through              |
 | Logging and audit      | `pino`                                                                    | JSON lines to stdout                                                                              |
@@ -516,7 +516,7 @@ src/
     reader.ts              dispatch by type and quality; fast; accurate for PDFs and images
     services/              Document Intelligence and vision model clients, retries and authentication
     pdf/                   pdf.js reader process (host, child, messages, text layer, form fields)
-    accurate/              page call (prompt, fences), tiles, fallback recipe
+    accurate/              page call (prompt, fences), fallback recipe
     images.ts, office.ts   image decoding, the DOCM rewrite
     pages.ts               page selections
 terraform/                 reference deployment module
@@ -534,9 +534,9 @@ test/
   - URL signing: tampering, expiry, other keys, an upload token used for a download and the reverse;
   - name rules and percent-decoding; page selections;
   - type detection for every accepted type, plus wrong extensions, truncated files, AVIF, plain ZIPs, Office templates, XML, a 64 MiB ZIP bomb in `[Content_Types].xml` and an entry that inflates beyond the size it states; the DOCM rewrite with every other entry copied;
-  - splitting the transcript into pages, tiling, the prompt with its fences (and a fence inside the data), the fallback recipe, result files and the page index;
+  - splitting the transcript into pages, the prompt with its fences (and a fence inside the data), the fallback recipe, result files and the page index;
   - images: TIFF pages, EXIF rotation, the size bound, and PNG and BMP headers that claim more pixels than the limit; a HEIC header that cannot be decoded;
-  - the service clients against mocks of Document Intelligence (long-running operations, `429` with `Retry-After`, refusals, failed analyses, refused credentials, cancellation) and Azure OpenAI (finish reasons, content-filter rejections);
+  - the service clients against mocks of Document Intelligence (long-running operations, `429` with `Retry-After`, refusals, failed analyses, refused credentials, cancellation) and Azure OpenAI's Responses API (the stateless request shape, incomplete and refused answers, content-filter rejections, a failed response asked again);
   - the pdf.js reader on generated PDFs (text layer, form field, render), a file it cannot open, a reader that stalls and one that dies (both killed and reported), cancellation;
   - the document reader end to end against the mocks: both levels, the vision window, fallbacks per page, pdf.js carrying a refused PDF, `unreadable`, `too_many_pages`, page selections, images, Office files;
   - uploads (limits, `409` on concurrent `PUT`s of one name, `415`, expiry), jobs (validation, results, windows and truncation, per-document failures, cancellation, fair share, the maximum duration, takeover after a shutdown, wait, expiry and sweep);
@@ -545,19 +545,19 @@ test/
 - **Integration** (`pnpm test:integration`, Docker):
   - the Azure store against Azurite: write-once creates (also concurrent), nothing committed when the body fails, listing, leases; a job run by two replicas sharing real blob leases;
   - end to end with two server processes on Azurite, Entra-style tokens from a local issuer and `curl`: metadata and refusals without token or role, uploads (`415` included), both levels, downloads, the audit log free of content; a replica killed with SIGKILL mid-job and the other one finishing the job after the lease lapsed; stdio mode with its local store and data plane.
-- **Live check** (`pnpm test:live`, opt-in, not in CI) against real Document Intelligence and Azure OpenAI resources from a local `.env.live`: a generated born-digital PDF with a form field, a photo-like scan with a table and checkboxes, a multi-page TIFF and a DOCX, read at both levels, with the transcripts printed for review.
-- Test documents are generated; no real documents go into the repository. A real HEIC photo cannot be generated in the test environment (no HEVC encoder), so HEIC decoding is checked through the live check and in the image.
+- **Live check** (`pnpm test:live`, opt-in, not in CI) against real Document Intelligence and Azure OpenAI resources from a local `.env.live`: a generated born-digital PDF with a form field, a photo-like scan with a table and checkboxes, a multi-page TIFF, a DOCX and a DOCM, read at both levels, with the transcripts printed for review.
+- Test documents are generated; no real documents go into the repository. A real HEIC photo cannot be generated in the test environment (no HEVC encoder), so the decoding of real HEIC photos is not covered by the tests; the decoder is checked to load in the image.
 
 ## 11. Implementation status
 
-All of §1–§10 is implemented. The unit and integration tests run against mocks of both services, Azurite and generated documents; the image was checked to read, render and decode in its container.
+All of §1–§10 is implemented. The unit and integration tests run against mocks of both services, Azurite and generated documents; the image was checked to read, render and decode in its container. The live check passed against a real Document Intelligence resource and a `gpt-5.6-luna` deployment through the Responses API.
 
 ## 12. Open questions
 
 **To verify at deployment**
 1. Entra end to end in the chosen mode, as for Periscope.
 2. The ingress limits for uploads of `LOUPE_MAX_FILE_BYTES`.
-3. The live check against the deployment's Document Intelligence resource and vision model deployment, and their throughput limits against the concurrency defaults.
+3. The throughput limits of the deployment's Document Intelligence resource and vision model deployment against the concurrency defaults.
 
 **Decided**
 - Quality levels `fast` and `accurate`.

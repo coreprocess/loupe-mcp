@@ -84,29 +84,52 @@ describe('service clients', () => {
         await assert.rejects(analysis, /cancelled/);
     });
 
-    it('sends images before the text and accepts only complete answers', async () => {
+    it('sends a stateless Responses request with the images first, in original detail', async () => {
         const answer = await vision.complete({
-            system: 'system prompt',
+            instructions: 'page instructions',
             images: [{ mediaType: 'image/png', data: Buffer.from('png') }],
             text: '## Page number\n\n4',
+            cacheKey: 'loupe-page',
             signal: signal(),
         });
         assert.deepEqual(answer, { kind: 'answer', text: '<p>Vision page 4</p>' });
         const call = mock.visionCalls[0];
         assert.equal(call?.images, 1);
-        assert.equal(call?.system, 'system prompt');
-        assert.equal(call?.body.reasoning_effort, 'low');
+        assert.equal(call?.instructions, 'page instructions');
+        const body = call?.body as Record<string, unknown> & {
+            input: { content: { type: string; detail?: string }[] }[];
+        };
+        assert.equal(body.model, 'vision');
+        assert.equal(body.store, false);
+        assert.deepEqual(body.reasoning, { effort: 'low' });
+        assert.equal(body.prompt_cache_key, 'loupe-page');
+        assert.ok(typeof body.max_output_tokens === 'number');
+        assert.deepEqual(
+            body.input[0]?.content.map((part) => [part.type, part.detail]),
+            [
+                ['input_image', 'original'],
+                ['input_text', undefined],
+            ]
+        );
+    });
 
+    it('accepts only completed answers and asks again after a failed response', async () => {
+        const ask = (page: number) =>
+            vision.complete({
+                instructions: '',
+                images: [],
+                text: `## Page number\n\n${page}`,
+                cacheKey: 'k',
+                signal: signal(),
+            });
         mock.behavior.truncatePages.add(5);
-        const cut = await vision.complete({ system: '', images: [], text: '## Page number\n\n5', signal: signal() });
-        assert.equal(cut.kind, 'rejected');
+        assert.deepEqual(await ask(5), { kind: 'rejected', reason: 'response incomplete: max_output_tokens' });
         mock.behavior.rejectPages.add(6);
-        const filtered = await vision.complete({
-            system: '',
-            images: [],
-            text: '## Page number\n\n6',
-            signal: signal(),
-        });
-        assert.deepEqual(filtered.kind, 'rejected');
+        assert.equal((await ask(6)).kind, 'rejected');
+        mock.behavior.refusePages.add(7);
+        assert.deepEqual(await ask(7), { kind: 'rejected', reason: 'refusal' });
+        mock.behavior.failOncePages.add(8);
+        assert.deepEqual(await ask(8), { kind: 'answer', text: '<p>Vision page 8</p>' });
+        assert.equal(mock.visionCalls.filter((call) => call.page === 8).length, 2);
     });
 });

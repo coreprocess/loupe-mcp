@@ -10,7 +10,7 @@ import sharp from 'sharp';
 import { parsePageSelection } from '../../src/reading/pages.ts';
 import type { Quality, ReadResult } from '../../src/reading/types.ts';
 import { DOCUMENT_TYPES, type DocumentType } from '../../src/uploads/types.ts';
-import { makeOffice } from '../helpers/office.ts';
+import { makeWord } from '../helpers/office.ts';
 import { makePdf } from '../helpers/pdf.ts';
 import { createReader } from '../helpers/reader.ts';
 
@@ -68,7 +68,8 @@ describe('live services', {
                     .tiff()
                     .toBuffer(),
             ],
-            ['letter.docx', DOCUMENT_TYPES.docx, makeOffice('docx')],
+            ['letter.docx', DOCUMENT_TYPES.docx, makeWord('docx', ['Dear customer,', 'your order 4711 has shipped.'])],
+            ['macro.docm', DOCUMENT_TYPES.docm, makeWord('docm', ['A macro-enabled letter'])],
         ];
     };
 

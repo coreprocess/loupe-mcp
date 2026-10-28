@@ -1,6 +1,6 @@
 /**
  * One vision call per page (concept §6.2). The model gets every signal the preparation found (the
- * page image, tiled when large, the text layer, the form fields, the OCR transcript) and reconciles
+ * page image, the text layer, the form fields, the OCR transcript) and reconciles
  * them into one HTML fragment. Every input taken from the document travels between per-request
  * fences, so text in the document cannot pose as a section of the prompt.
  */
@@ -9,7 +9,6 @@ import type { PdfFormData } from '../pdf/form-data.ts';
 import type { PdfDocumentInfo } from '../pdf/messages.ts';
 import type { VisionImage, VisionModel } from '../services/vision.ts';
 import { PAGE_PROMPT } from './prompt.ts';
-import { type PageImages, tilePage } from './tiles.ts';
 
 /** Everything known about one page; any input may be missing. */
 export interface PageInputs {
@@ -25,12 +24,6 @@ export interface DocumentContext {
     language: string | undefined;
     info: PdfDocumentInfo | null;
 }
-
-const LAYOUT_DESCRIPTIONS: Record<PageImages['layout'], string> = {
-    single: 'Attached above as a single full-page image.',
-    bands: 'Attached above as four overlapping horizontal bands, top to bottom.',
-    grid: 'Attached above as four overlapping quadrants in row-major order (top-left, top-right, bottom-left, bottom-right).',
-};
 
 /** The model wraps its answer in a code fence now and then, despite being told not to. */
 const CODE_FENCE = /^```(?:html)?\s*\n([\s\S]*?)\n?```$/;
@@ -52,12 +45,12 @@ export const transcribePage = async (
     signal: AbortSignal
 ): Promise<string | null> => {
     if (!hasInput(page)) return null;
-    const tiles = page.image ? await tilePage(page.image) : null;
     const fence = randomBytes(8).toString('hex');
     const outcome = await model.complete({
-        system: PAGE_PROMPT.replaceAll('{{fence}}', fence),
-        images: tiles?.images ?? [],
-        text: userText(page, document, tiles, fence),
+        instructions: PAGE_PROMPT.replaceAll('{{fence}}', fence),
+        images: page.image ? [page.image] : [],
+        text: userText(page, document, fence),
+        cacheKey: 'loupe-page',
         signal,
     });
     if (outcome.kind === 'rejected') return null;
@@ -65,12 +58,7 @@ export const transcribePage = async (
 };
 
 /** One `##` section per input, in the order the instructions announce; a missing input is marked `(empty)`. */
-export const userText = (
-    page: PageInputs,
-    document: DocumentContext,
-    tiles: PageImages | null,
-    fence: string
-): string => {
+export const userText = (page: PageInputs, document: DocumentContext, fence: string): string => {
     // the fence must not occur in the data itself, or the data could close its own section
     const fenced = (content: string) => `<<<DATA-${fence}>>>\n${content.replaceAll(fence, '')}\n<<<END-${fence}>>>`;
     const info = document.info && Object.keys(document.info).length > 0 ? document.info : null;
@@ -84,7 +72,7 @@ export const userText = (
         '## Page number',
         String(page.number),
         '## Page image',
-        tiles ? LAYOUT_DESCRIPTIONS[tiles.layout] : '(no image available)',
+        page.image ? 'Attached above as one image at its original resolution.' : '(no image available)',
         '## Page text layer',
         page.embeddedText ? fenced(page.embeddedText) : '(empty)',
         '## Page form fields (JSON)',

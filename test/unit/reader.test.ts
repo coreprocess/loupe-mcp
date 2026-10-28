@@ -78,7 +78,7 @@ describe('document reader', () => {
         assert.deepEqual(progress, [1, 2, 3]);
         assert.equal(mock.analyzeCalls[0]?.query.get('features'), 'ocrHighResolution');
         const first = mock.visionCalls.find((call) => call.page === 1);
-        assert.equal(first?.images, 4);
+        assert.equal(first?.images, 1);
         assert.match(first?.text ?? '', /str="First page"/);
         assert.match(first?.text ?? '', /"customer"/);
         assert.match(first?.text ?? '', /OCR text of page 1/);
