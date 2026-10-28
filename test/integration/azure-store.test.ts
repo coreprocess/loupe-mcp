@@ -110,6 +110,15 @@ describe('azure blob store', () => {
 
             const first = harness.runner;
             first.start();
+            // a started document shows as running with the next state write, at most 5 s later
+            for (
+                let i = 0;
+                i < 300 && (await harness.jobs.snapshot(job.jobId)).state.documents[1]?.status !== 'running';
+                i++
+            ) {
+                await delay(50);
+            }
+            // the second replica polls too, but the lease keeps the job with the first one
             const second = harness.replica({
                 read: async (request) => ({
                     format: 'markdown',
@@ -117,13 +126,6 @@ describe('azure blob store', () => {
                 }),
             });
             second.start();
-            // the second replica polls too, but the lease keeps the job with the first one
-            for (
-                let i = 0;
-                i < 100 && (await harness.jobs.snapshot(job.jobId)).state.documents[1]?.status !== 'running';
-                i++
-            )
-                await delay(50);
             await delay(500);
             assert.deepEqual(
                 (await harness.jobs.snapshot(job.jobId)).state.documents.map((d) => d.status),
