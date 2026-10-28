@@ -1,6 +1,6 @@
 # Loupe MCP: Concept
 
-Status: draft for review · 2026-10-28
+Status: implemented · 2026-10-28
 
 Loupe is an MCP server that reads documents for AI agents. It turns PDFs, scans, photos and Office files into text. An agent uploads files over HTTP from its sandbox, submits them as one batch job at one of two quality levels, and gets the text per document and page: either paged into context, or downloaded.
 
@@ -83,7 +83,7 @@ agent sandbox (curl) ── PUT ─▶ /u/<signed-token>/… ────▶│ 
 
 ## 4. Configuration
 
-All configuration comes from environment variables. In Azure, secrets come in as Key Vault references. For local development, `--env-file <path>` loads a gitignored dotenv file. Loupe refuses to start, naming the offending variable, when a value is invalid, a required one is missing, or `LOUPE_RETENTION` does not exceed `LOUPE_MAX_JOB_DURATION` plus `LOUPE_URL_TTL`.
+All configuration comes from environment variables; the complete reference, including the broker-mode settings and the overrides for tests (`LOUPE_HOST`, `LOUPE_STORE_CONNECTION_STRING`, `LOUPE_AUTH_ISSUER`, `LOUPE_AUTH_JWKS_URI`, …), is [configuration.md](configuration.md). In Azure, secrets come in as Key Vault references. For local development, `--env-file <path>` loads a gitignored dotenv file. Loupe refuses to start, naming the offending variable, when a value is invalid, a required one is missing, or `LOUPE_RETENTION` does not exceed `LOUPE_MAX_JOB_DURATION` plus `LOUPE_URL_TTL`.
 
 | Variable                                                  | Default                                  | Purpose                                                                                                                                         |
 | --------------------------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -111,7 +111,7 @@ All configuration comes from environment variables. In Azure, secrets come in as
 | `LOUPE_MAX_PAGES`                                         | `2000`                                   | Most pages Loupe reads of one document; a longer one fails with `too_many_pages` unless `pages` selects fewer                                  |
 | `LOUPE_ACCURATE_MAX_PAGES`                                | `100`                                    | Pages per document the vision model transcribes; the pages after them are read as in `fast` and marked `layout`                                |
 | `LOUPE_MAX_JOB_DURATION`                                  | `PT12H`                                  | A job's documents still open after this fail with `timeout`                                                                                     |
-| `LOUPE_ANALYSIS_CONCURRENCY`                              | `4`                                      | Document Intelligence analyses in flight per replica                                                                                            |
+| `LOUPE_ANALYSIS_CONCURRENCY`                              | `4`                                      | Documents read at once per replica, each with one Document Intelligence analysis at a time                                                     |
 | `LOUPE_VISION_CONCURRENCY`                                | `8`                                      | Vision-model page calls in flight per replica                                                                                                   |
 | `LOUPE_MAX_ACTIVE_JOBS`                                   | `8`                                      | Jobs one replica runs at once (§6.4)                                                                                                            |
 | `LOUPE_READ_MAX_BYTES`                                    | `65536`                                  | Maximum response size of a `read_result` window                                                                                                 |
@@ -197,14 +197,14 @@ get_job(jobId, wait?) → status
     "completedAt": null,
     "expiresAt": "2026-10-30T09:12:03Z",
 
-    "progress": { "documents": 120, "succeeded": 37, "failed": 1, "pages": 812, "pagesDone": 233 },
+    "progress": { "documents": 120, "succeeded": 37, "failed": 1, "cancelled": 0, "pages": 812, "pagesDone": 233 },
 
     "documents": [
         { "name": "contract.pdf", "status": "succeeded", "type": "application/pdf", "pages": 4,
           "methods": { "vision": 4 }, "bytes": 18234 },
         { "name": "receipt.heic", "status": "failed", "type": "image/heic",
           "error": { "code": "unreadable", "message": "The image could not be decoded." } },
-        { "name": "scan-0003.tif", "status": "running", "type": "image/tiff" }
+        { "name": "scan-0003.tif", "status": "running", "type": "image/tiff", "pagesDone": 2, "pagesTotal": 5 }
     ],
     "documentsTruncated": false,
 
@@ -221,9 +221,10 @@ get_job(jobId, wait?) → status
 | `documents[].status`      | `queued`, `running`, `succeeded`, `failed` or `cancelled`                                                                                                                                     |
 | `documents[].methods`     | How many pages each method produced (§2); for `accurate`, anything other than `vision` shows where the vision model did not deliver                                                          |
 | `documents[].bytes`       | Size of the result file                                                                                                                                                                       |
+| `documents[].pagesDone`   | For a running document: pages finished of `pagesTotal`                                                                                                                                       |
 | `documents[].error.code`  | `unreadable` (corrupt, encrypted, or refused by Document Intelligence), `too_many_pages`, `timeout`, `service_unavailable` (the services stayed unavailable through every retry), `internal` |
 | `documentsTruncated`      | Only the first 200 documents are inline; the manifest lists all                                                                                                                              |
-| `download.manifestUrl`    | The single entry point for downloads (§6.6). It is already valid while the job runs and lists the documents finished so far.                                                                |
+| `download.manifestUrl`    | The single entry point for downloads (§6.6). It is already valid while the job runs and lists the documents finished so far. `download` is `null` once the job expired.                    |
 
 Like Periscope, `get_job` reports what is stored, on every replica alike: a status is reported only once it has been written to the store.
 
@@ -280,9 +281,9 @@ The design is taken from two production document pipelines, made generic.
 **PDF**
 1. **Preparation, in parallel:**
    - Document Intelligence as in `fast`, plus the `ocrHighResolution` add-on: a Markdown transcript per page.
-   - pdf.js, **in a child process of its own** with memory and time limits: per page the text layer (as a geometry report for the model and as readable text for the fallback), the AcroForm fields, and a rendered PNG for the pages the vision model will see; for the whole file its info dictionary.
+   - pdf.js, **in a child process of its own** with memory and time limits: per page the text layer (as a geometry report for the model and as readable text for the fallback) and the AcroForm fields; for the whole file its info dictionary. A first, short run counts the pages, so the page selection and `LOUPE_MAX_PAGES` apply before anything is read. A replica runs at most two reader processes, each with a 1 GiB heap and only the environment Node needs; one that opens no file within 3 minutes, reports no page for 90 seconds or runs 10 minutes is killed.
 2. **Merge per page.** When both sources agree on the page count, every page gets every input. When they disagree, Document Intelligence's pagination wins and the pdf.js page fields are dropped, since an index-wise merge would misalign them. Either source may be missing: when the service refuses the file, pdf.js carries it; when pdf.js can't open the file or its process is killed, Loupe retries without page renders, then without pdf.js, and the transcript carries it. Only when both are missing is the document `unreadable`.
-3. **One vision-model call per page**, for the first `LOUPE_ACCURATE_MAX_PAGES` pages, `LOUPE_VISION_CONCURRENCY` at a time per replica. The model gets:
+3. **One vision-model call per page**, for the first `LOUPE_ACCURATE_MAX_PAGES` pages, `LOUPE_VISION_CONCURRENCY` at a time per replica. Page images are rendered at up to 200 DPI (at most 8 megapixels), eight pages per reader process at a time, so they never pile up in memory; when the render fails, the page is transcribed without its image. The call goes to the Azure OpenAI deployment `LOUPE_VISION_MODEL` (chat completions, with `reasoning_effort`). The model gets:
    - the page image first (models attend more reliably to images that precede the text about them); a large page is split into four overlapping tiles, as strips or as a 2×2 grid depending on its shape, and the prompt says which;
    - then one section per input: the PDF info, the file name, the page number, the text layer, the form fields, the Document Intelligence transcript. A missing input is marked `(empty)`, so the model can tell "not provided" from "blank".
 
@@ -299,7 +300,7 @@ The design is taken from two production document pipelines, made generic.
 5. **Only a complete answer counts.** A call the model rejects (content filter, input too large) or an answer cut off before its end yields no page; the page takes the fallback. A timeout or an outage is retried (§6.4).
 6. **Fallback per page,** for the pages after the vision window and for every page the model did not deliver: the Document Intelligence transcript rendered to HTML (method `layout`), else the readable text layer and form fields as preformatted text (`text-layer`), else a placeholder that says the page could not be read (`none`). No page is ever missing.
 
-**Images.** Each image (each page of a TIFF) is one page. Document Intelligence reads the file with high-resolution OCR; the image itself, upright according to its EXIF orientation, is the page image of the vision call. HEIC/HEIF and BMP are converted to JPEG first, and TIFF pages to PNG, since the model takes none of these formats. There is no text layer and there are no form fields. The fallback is the transcript, then the placeholder.
+**Images.** Each image (each page of a TIFF) is one page. Document Intelligence reads the file with high-resolution OCR; the image itself, upright according to its EXIF orientation and at most 4096 pixels on its long edge, is the page image of the vision call, as JPEG: HEIC/HEIF is decoded with libheif (WebAssembly), BMP with the canvas, everything else with sharp, each after checking the stated size against a limit of 100 megapixels. There is no text layer and there are no form fields. The fallback is the transcript, then the placeholder. When the image cannot be decoded, the transcript carries the page; when neither works, the document is `unreadable`.
 
 **Office files and HTML** are read as in `fast` (§2).
 
@@ -307,24 +308,27 @@ The design is taken from two production document pipelines, made generic.
 
 ```
 uploads/<uploadId>/upload.json              created, expiry, issuing user
-uploads/<uploadId>/files/<name>             the uploaded bytes, write-once
+uploads/<uploadId>/files/<key>              the uploaded bytes, write-once
+uploads/<uploadId>/accepted/<key>.json      name, detected type, size, SHA-256: written once the file is accepted
 jobs/<jobId>/job.json                       quality, options, the files with size and SHA-256, issuing user
-jobs/<jobId>/state.json                     status and progress per document
+jobs/<jobId>/state.json                     status and progress per document, with each result's page index
 jobs/<jobId>/cancel.json                    present once cancel_job was called
 jobs/<jobId>/manifest.json                  the download manifest (§6.6)
-jobs/<jobId>/documents/<name>.md|.html      one result file per document
-queue/<jobId>                               present while the job is open; leased by the replica running it
+jobs/<jobId>/documents/<index>.md|.html     one result file per document, by its position in the job
+queue/<created>-<jobId>                     present while the job is open; leased by the replica running it
 ```
 
-A document's result file is written once, when the document succeeds, together with its page index (each page's number, method, and byte offset and length in the file). `read_result` reads the index and fetches only the byte range of the pages in its window.
+A file is stored under its key, the SHA-256 of its name, so any accepted name fits every store; names appear only in the JSON records. A file belongs to the upload only once its `accepted` record exists. A job reads the file and checks its SHA-256 against the one recorded at submit time.
+
+A document's result file is written once, when the document succeeds; its page index (each page's number, method, and byte offset and length in the file) goes into the state. `read_result` reads the index and fetches only the byte range of the pages in its window.
 
 ### 6.4 Execution
 
-- **Queue and leases.** `submit` writes the job and its queue entry. Every replica polls the queue (every 2 s, and at once after a local `submit`) and takes up to `LOUPE_MAX_ACTIVE_JOBS` jobs by acquiring a 60-second blob lease on their queue entries, renewed every 15 s. Only the lease holder writes a job's state, so state has one writer. The oldest job is taken first.
-- **Takeover.** When a replica dies or loses its lease, the lease lapses and another replica (or the same one after its restart) takes the job over. Documents that succeeded are kept; documents that were running start again. In the filesystem store (stdio), one process holds every job, and leases are in memory.
+- **Queue and leases.** `submit` writes the job record, its initial state and manifest, then its queue entry. Every replica polls the queue (every 2 s, and at once after a local `submit` or `cancel_job`) and takes up to `LOUPE_MAX_ACTIVE_JOBS` jobs by acquiring a 60-second blob lease on their queue entries, renewed every 15 s. Only the lease holder writes a job's state, so state has one writer. Queue entries are named by creation time, so the oldest job is taken first. A finished job's entry is deleted with its lease.
+- **Takeover.** When a replica dies or loses its lease, the lease lapses (within 60 seconds) and another replica (or the same one after its restart) takes the job over. Documents that succeeded are kept; documents that were running start again. A replica that fails to renew a lease stops the job's documents at once and writes nothing more for it. In the filesystem store (stdio), one process holds every job, and leases are in memory.
 - **Shutdown.** On SIGTERM a replica stops taking documents, aborts its running calls, writes the state of its jobs and releases its leases, so another replica continues at once.
-- **Fair share.** A replica's running jobs take turns: documents are started round-robin across them, within `LOUPE_ANALYSIS_CONCURRENCY` and `LOUPE_VISION_CONCURRENCY`. A single large batch therefore doesn't hold back a small job submitted after it.
-- **Retries.** Throttling (`429`) and server errors of Document Intelligence and Azure OpenAI are retried with exponential backoff, honoring `Retry-After`, for up to 10 minutes per call; then the document fails with `service_unavailable`. A refusal of the file itself (`InvalidRequest`, `InvalidArgument`) is a verdict, not retried: `unreadable` in `fast`, the fallback in `accurate`.
+- **Fair share.** A replica's running jobs take turns: documents are started round-robin across them, at most `LOUPE_ANALYSIS_CONCURRENCY` at a time; their page calls share `LOUPE_VISION_CONCURRENCY`. A single large batch therefore doesn't hold back a small job submitted after it.
+- **Retries.** Throttling (`429`), timeouts and server errors of Document Intelligence and Azure OpenAI are retried with exponential backoff, honoring `Retry-After`, for up to 10 minutes per call; then the document fails with `service_unavailable`. A refusal of the file itself (`400`, or an analysis that fails with a code other than `InternalServerError`) is a verdict, not retried: `unreadable` in `fast`, the other source carries the document in `accurate`. Refused credentials or a missing deployment (`401`, `403`, `404`) fail the document with `service_unavailable` at once and are logged as an operator error.
 - **Limits.** `LOUPE_MAX_JOB_DURATION` per job, `LOUPE_MAX_PAGES` per document, and the upload limits (§6.5).
 - **Progress.** `state.json` is written on every finished document and at most every 5 s otherwise.
 - **Cancellation.** `cancel_job` writes `cancel.json`; the lease holder sees it within a few seconds, aborts the running calls, and marks the open documents `cancelled`.
@@ -334,9 +338,9 @@ A document's result file is written once, when the document succeeds, together w
 
 - **Endpoint.** `PUT /u/<token>/<name>`, one file per request, body streamed into the store. Nothing else is served under `/u/`: no `GET`, no listing, no other methods. Uploaded files are never served back.
 - **Token.** HMAC-signed with a key derived for this purpose from `LOUPE_SIGNING_KEY`, so an upload token can never pass as a download token or the reverse. It contains the upload ID, the issuing user and the expiry (`LOUPE_URL_TTL`). It is stateless and works on any replica.
-- **Names.** One path segment, percent-decoded, valid UTF-8, at most 255 bytes, no control characters, no `/` or `\`, not `.` or `..`. Names are unique per upload and **write-once**: the store write is conditional (`If-None-Match: *`), so of two concurrent `PUT`s of one name exactly one succeeds, and the other gets `409`.
+- **Names.** One path segment, percent-decoded, valid UTF-8, at most 255 bytes, no control characters, no `/` or `\`, not `.` or `..` (`400` otherwise). Names are unique per upload and **write-once**: the store write is conditional (`If-None-Match: *` on Azure, an atomic link on the filesystem), so of two concurrent `PUT`s of one name exactly one succeeds, and the other gets `409`.
 - **Checks while streaming.** The body is counted and hashed (SHA-256) on the way in; a file over `LOUPE_MAX_FILE_BYTES` is cut off with `413` and deleted. After the body, the type is detected from the content (§2); an unsupported type gets `415` and is deleted. Before a file is accepted, the upload's file count and bytes are checked against `LOUPE_UPLOAD_MAX_FILES` and `LOUPE_UPLOAD_MAX_BYTES` (`413`). Concurrent `PUT`s can exceed the byte limit by at most the files in flight.
-- **Answer.** `201` with `{ "name", "bytes", "sha256", "type" }`, so the agent sees at once what Loupe recognized. Errors carry a JSON body with a code and message. An expired or invalid token gets `403`, an expired upload `410`.
+- **Answer.** `201` with `{ "name", "bytes", "sha256", "type" }`, so the agent sees at once what Loupe recognized. Errors carry a JSON body `{ "error": { "code", "message" } }`. An expired or invalid token (or a download token) gets `403`, an expired upload `410`, any method but `PUT` `405`. A refused body is not read to its end; the connection closes after the answer.
 
 ### 6.6 Downloads
 
@@ -353,7 +357,6 @@ A document's result file is written once, when the document succeeds, together w
     "jobId": "j_4fKq9…",
     "quality": "accurate",
     "status": "completed",
-    "format": "html",
     "documents": [
         {
             "name": "contract.pdf",
@@ -361,6 +364,7 @@ A document's result file is written once, when the document succeeds, together w
             "type": "application/pdf",
             "sourceBytes": 482113,
             "sourceSha256": "…",
+            "format": "html",
             "path": "documents/contract.pdf.html",
             "bytes": 18234,
             "sha256": "…",
@@ -382,7 +386,7 @@ A document's result file is written once, when the document succeeds, together w
 }
 ```
 
-While the job runs, the manifest lists every document with its current status; a document gets its `path` once its result file is complete. The page byte ranges let an agent fetch single pages with `curl -r`.
+While the job runs, the manifest lists every document with its current status; a document gets its `format` and `path` once its result file is complete. `format` is `html` for PDFs and images read `accurate`, `markdown` otherwise. The page byte ranges let an agent fetch single pages with `curl -r`. `path` is percent-encoded and relative to the manifest; result files are served under the document's name plus `.md` or `.html`.
 
 ---
 
@@ -390,7 +394,7 @@ While the job runs, the manifest lists every document with its current status; a
 
 ### 7.1 Principles
 
-- **A fixed outbound surface.** Loupe talks to its store, Document Intelligence, Azure OpenAI and Entra ID, and nothing else. It never fetches a URL from a request or a document: files reach Document Intelligence as bytes, pdf.js runs without network access and without evaluating scripts, and the vision model has no tools.
+- **A fixed outbound surface.** Loupe talks to its store, Document Intelligence, Azure OpenAI and Entra ID, and nothing else. It never fetches a URL from a request or a document: files reach Document Intelligence as bytes, pdf.js gets the file's bytes and its own bundled fonts and decoders (no system fonts, no URLs) in a process without credentials, and the vision model has no tools.
 - **Uploaded files are untrusted.** Every local parser runs with limits:
   - pdf.js in a child process with memory and time limits; a reader that hangs or dies is killed and the document continues without it (§6.2);
   - image decoding (sharp, the HEIC decoder) with a pixel limit against decompression bombs;
@@ -443,7 +447,7 @@ Loupe uses **its own user-assigned managed identity**:
 ### 8.1 Image
 
 - `ghcr.io/coreprocess/loupe-mcp:<semver>`, public, built by GitHub Actions on each tag, with SBOM and provenance attestation. Deployments pin the version or digest.
-- A slim Node 24 image: sharp brings its own libvips, pdf.js and the HEIC decoder are JavaScript/WASM.
+- A slim Node 24 image: sharp and the canvas bring prebuilt native binaries for amd64 and arm64; pdf.js and the HEIC decoder are JavaScript and WebAssembly. CI builds the image on every change and checks that it starts.
 - The same image runs in stdio mode for local development (`docker run -i …`, with a mounted store directory).
 
 ### 8.2 Reference deployment on Azure
@@ -484,68 +488,76 @@ A reusable module in this repository (`terraform/`). It takes the Container Apps
 | MCP                    | `@modelcontextprotocol/server`, `/express`, `/node` (v2 SDK)              | Stateless Streamable HTTP and stdio; bearer validation on `jose`                                  |
 | Validation             | `zod`                                                                     | Configuration and tool schemas                                                                    |
 | Store                  | `@azure/storage-blob`, `@azure/identity`                                  | Conditional writes for write-once files, blob leases for the queue                                |
-| Document Intelligence  | `@azure-rest/ai-document-intelligence`                                    | Long-running analysis with its poller                                                             |
-| Vision model           | `openai` (Azure OpenAI)                                                   | Chat completions with image parts                                                                 |
+| Document Intelligence  | REST API `2024-11-30` over `undici`                                       | Long-running analysis, polled; retries and `Retry-After` under Loupe's control                    |
+| Vision model           | Azure OpenAI chat completions over `undici`                               | Image parts first; long header and body timeouts, a deadline per call                             |
 | PDF                    | `pdfjs-dist`                                                              | In a child process; text layer, AcroForm fields, page renders                                     |
-| Images                 | `sharp`, `heic-decode`                                                    | Rotation, conversion, tiling, TIFF pages                                                          |
-| Office                 | a streaming ZIP reader                                                    | Type detection from `[Content_Types].xml`, the DOCM rewrite                                       |
+| Images                 | `sharp`, `heic-decode`, `@napi-rs/canvas`                                 | Rotation, conversion, tiling, TIFF pages; BMP decoding; pdf.js's canvas in Node                   |
+| Office                 | Loupe's own minimal ZIP reader on `node:zlib`                             | Type detection from `[Content_Types].xml` by ranged reads, the DOCM rewrite; bounded inflation    |
 | Fallback rendering     | `markdown-it`                                                             | Transcript Markdown to HTML, with the service's literal `<table>` markup let through              |
 | Logging and audit      | `pino`                                                                    | JSON lines to stdout                                                                              |
 
-**Shared code with Periscope.** Authentication (both modes), URL signing, the store client, the Range responses and the audit log are copied from Periscope rather than shared as a package. The two servers evolve independently.
+**Shared code with Periscope.** Authentication (both modes), the store clients, the Range responses and the audit log are copied from Periscope rather than shared as a package. The two servers evolve independently. Both service APIs are called with plain HTTP rather than their SDKs: the APIs used are small, and retries, deadlines and test mocks stay simple.
 
 ### 9.2 Code structure
 
 ```
 src/
-  index.ts                 CLI entry: transport selection, --env-file
-  config/                  env schema
-  auth/                    PRM endpoint, JWT validation, role checks; broker
-  tools/                   the five MCP tools
-  store/                   azureblob, filesystem; leases
-  uploads/                 PUT endpoint, name rules, type detection, limits
-  download/                GET endpoint, manifest, Range, headers
-  signing/                 upload and download tokens, key derivation
-  jobs/                    queue, leases, scheduler (fair share), state, retries, cancellation
+  index.ts                 CLI entry: transport selection, --env-file, wiring
+  config/env.ts            environment schema
+  auth/                    Entra resource server; broker (authorization server in front of Entra)
+  core/                    errors, ids, URL signing, logging, durations, semaphore
+  tools/tools.ts           the five MCP tools
+  server/                  HTTP app, upload endpoint, download endpoint (Range, headers)
+  store/                   store interface, azureblob, filesystem (leases), paths
+  uploads/                 upload service, name rules, type detection, minimal ZIP reader
+  jobs/                    model, job service (submit, status, windows, sweep), runner (queue, leases,
+                           fair share, cancellation, deadlines, takeover), result files and manifest
   reading/
-    fast.ts                Document Intelligence layout → Markdown pages
-    accurate/              PDF preparation (Document Intelligence + pdf.js child), merge,
-                           page call (tiles, fences, prompt), fallback recipe, images
-    services/              Document Intelligence and Azure OpenAI clients
-  core/                    limits, audit, errors
+    reader.ts              dispatch by type and quality; fast; accurate for PDFs and images
+    services/              Document Intelligence and vision model clients, retries and authentication
+    pdf/                   pdf.js reader process (host, child, messages, text layer, form fields)
+    accurate/              page call (prompt, fences), tiles, fallback recipe
+    images.ts, office.ts   image decoding, the DOCM rewrite
+    pages.ts               page selections
 terraform/                 reference deployment module
 test/
-  unit/                    config, signing, names, type detection, page splitting, tiles, prompt, fallback, manifest
-  integration/             Azurite, mock services, end to end
+  unit/                    no Docker: config, core, uploads and ZIP, reading, service clients against mocks,
+                           pdf.js reader, document reader, jobs and runner, HTTP and tools, broker
+  integration/             Azurite store and two replicas; end to end with two server processes, curl and stdio
+  live/                    opt-in check against real services (pnpm test:live)
 ```
-
----
 
 ## 10. Testing
 
-- **Unit:**
+- **Unit** (`pnpm test`, no Docker):
   - configuration validation;
-  - URL signing: tampering, expiry, an upload token used for a download and the reverse;
-  - name rules and percent-decoding;
-  - type detection for every accepted type, plus wrong extensions, truncated files, polyglots and macro-enabled packages named `.docx`;
-  - splitting the transcript into pages, tiling, the prompt with its fences, the fallback recipe, the manifest and the page index.
-- **Integration** against Azurite and mocks of Document Intelligence (long-running operations, `429` with `Retry-After`, refusals, failed and never-finishing analyses) and Azure OpenAI (finish reasons, content-filter rejections, timeouts):
-  - end to end with the real process and tokens from a local issuer: `create_upload` → `curl` uploads → `submit` → `get_job` → `read_result` while running → manifest download → checksums, for both quality levels and every input type;
-  - uploads: limits, `409` on concurrent `PUT`s of one name, `415`, expired tokens, nothing readable under `/u/`;
-  - downloads: Range, page byte ranges, internal files never served;
-  - takeover: a replica killed mid-job, a second one finishes it without redoing succeeded documents; graceful shutdown; fair share between a large and a small job;
-  - cancellation, maximum job duration, retention expiry;
-  - hostile files: an image decompression bomb, a ZIP bomb in an Office package, a PDF that hangs pdf.js (reader killed, transcript carries the document), a document over `LOUPE_MAX_PAGES`.
-- **Live check** (opt-in, not in CI) against real Document Intelligence and Azure OpenAI resources from a local `.env`: a synthetic corpus with a born-digital PDF, a scan, a phone photo, a filled-in form with handwriting, a multi-page TIFF, a HEIC photo and DOCX/XLSX/PPTX files, read at both levels. Test documents are generated; no real documents go into the repository.
+  - URL signing: tampering, expiry, other keys, an upload token used for a download and the reverse;
+  - name rules and percent-decoding; page selections;
+  - type detection for every accepted type, plus wrong extensions, truncated files, AVIF, plain ZIPs, Office templates, XML, a 64 MiB ZIP bomb in `[Content_Types].xml` and an entry that inflates beyond the size it states; the DOCM rewrite with every other entry copied;
+  - splitting the transcript into pages, tiling, the prompt with its fences (and a fence inside the data), the fallback recipe, result files and the page index;
+  - images: TIFF pages, EXIF rotation, the size bound, and PNG and BMP headers that claim more pixels than the limit; a HEIC header that cannot be decoded;
+  - the service clients against mocks of Document Intelligence (long-running operations, `429` with `Retry-After`, refusals, failed analyses, refused credentials, cancellation) and Azure OpenAI (finish reasons, content-filter rejections);
+  - the pdf.js reader on generated PDFs (text layer, form field, render), a file it cannot open, a reader that stalls and one that dies (both killed and reported), cancellation;
+  - the document reader end to end against the mocks: both levels, the vision window, fallbacks per page, pdf.js carrying a refused PDF, `unreadable`, `too_many_pages`, page selections, images, Office files;
+  - uploads (limits, `409` on concurrent `PUT`s of one name, `415`, expiry), jobs (validation, results, windows and truncation, per-document failures, cancellation, fair share, the maximum duration, takeover after a shutdown, wait, expiry and sweep);
+  - the HTTP app with the MCP client: the whole flow, upload and download answers, Range, `304`, `416`, headers, internal files never served, DNS rebinding;
+  - the broker (authorization server) against an Entra stand-in.
+- **Integration** (`pnpm test:integration`, Docker):
+  - the Azure store against Azurite: write-once creates (also concurrent), nothing committed when the body fails, listing, leases; a job run by two replicas sharing real blob leases;
+  - end to end with two server processes on Azurite, Entra-style tokens from a local issuer and `curl`: metadata and refusals without token or role, uploads (`415` included), both levels, downloads, the audit log free of content; a replica killed with SIGKILL mid-job and the other one finishing the job after the lease lapsed; stdio mode with its local store and data plane.
+- **Live check** (`pnpm test:live`, opt-in, not in CI) against real Document Intelligence and Azure OpenAI resources from a local `.env.live`: a generated born-digital PDF with a form field, a photo-like scan with a table and checkboxes, a multi-page TIFF and a DOCX, read at both levels, with the transcripts printed for review.
+- Test documents are generated; no real documents go into the repository. A real HEIC photo cannot be generated in the test environment (no HEVC encoder), so HEIC decoding is checked through the live check and in the image.
 
----
+## 11. Implementation status
 
-## 11. Open questions
+All of §1–§10 is implemented. The unit and integration tests run against mocks of both services, Azurite and generated documents; the image was checked to read, render and decode in its container.
+
+## 12. Open questions
 
 **To verify at deployment**
 1. Entra end to end in the chosen mode, as for Periscope.
 2. The ingress limits for uploads of `LOUPE_MAX_FILE_BYTES`.
-3. Throughput limits of the Document Intelligence and Azure OpenAI resources against the concurrency defaults.
+3. The live check against the deployment's Document Intelligence resource and vision model deployment, and their throughput limits against the concurrency defaults.
 
 **Decided**
 - Quality levels `fast` and `accurate`.

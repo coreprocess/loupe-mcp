@@ -1,0 +1,81 @@
+# Entra ID app registration (concept §7.2). Order and exactness matter:
+# v2 tokens first, then the Application ID URI equal to the MCP URL (verified domain, no trailing slash).
+
+data "azuread_client_config" "current" {}
+
+locals {
+  mcp_url = "${var.public_url}/mcp"
+}
+
+resource "random_uuid" "scope" {}
+
+# Loupe.User is the only app role: it grants every tool.
+resource "random_uuid" "user" {}
+
+resource "azuread_application" "loupe" {
+  display_name     = var.name
+  sign_in_audience = "AzureADMyOrg"
+  identifier_uris  = [local.mcp_url]
+  owners           = [data.azuread_client_config.current.object_id]
+
+  api {
+    requested_access_token_version = 2
+
+    oauth2_permission_scope {
+      id                         = random_uuid.scope.result
+      value                      = "Loupe.Access"
+      type                       = "User"
+      enabled                    = true
+      admin_consent_display_name = "Access Loupe"
+      admin_consent_description  = "Upload documents to Loupe and read them."
+      user_consent_display_name  = "Access Loupe"
+      user_consent_description   = "Upload documents to Loupe and read them."
+    }
+  }
+
+  app_role {
+    id                   = random_uuid.user.result
+    value                = "Loupe.User"
+    display_name         = "Loupe.User"
+    description          = "Upload documents and read them with this Loupe"
+    allowed_member_types = ["User"]
+    enabled              = true
+  }
+
+  # claude.ai custom connector (confidential client with secret)
+  web {
+    redirect_uris = ["https://claude.ai/api/mcp/auth_callback"]
+  }
+
+  # Claude Code and other local clients (public client, PKCE, loopback redirect on any port)
+  public_client {
+    redirect_uris = ["http://localhost/", "http://127.0.0.1/"]
+  }
+}
+
+resource "azuread_service_principal" "loupe" {
+  client_id                    = azuread_application.loupe.client_id
+  app_role_assignment_required = true
+  owners                       = [data.azuread_client_config.current.object_id]
+}
+
+resource "azuread_app_role_assignment" "users" {
+  for_each = toset(var.users)
+
+  app_role_id         = random_uuid.user.result
+  principal_object_id = each.value
+  resource_object_id  = azuread_service_principal.loupe.object_id
+}
+
+resource "azuread_application_password" "connector" {
+  count          = var.create_connector_secret ? 1 : 0
+  application_id = azuread_application.loupe.id
+  display_name   = "claude.ai connector"
+}
+
+resource "azuread_application_pre_authorized" "azure_cli" {
+  count                = var.preauthorize_azure_cli ? 1 : 0
+  application_id       = azuread_application.loupe.id
+  authorized_client_id = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+  permission_ids       = [random_uuid.scope.result]
+}
